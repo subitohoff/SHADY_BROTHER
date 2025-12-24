@@ -1,493 +1,570 @@
-
- 
 #!/usr/bin/env python3
 
-import os
 import sys
 import time
 import threading
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
-import json
 
-from scapy.all import *
-from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt, Dot11Deauth, Dot11Disas
+from scapy.all import sniff, Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt, RadioTap
 import scapy.config
-import scapy.utils
 
-# Ustawienia debugowania Scapy
-scapy.config.conf.verb = 0  # Wyłącz verbose Scapy
+scapy.config.conf.verb = 0
 
 from data import WiFiNet, ClientDevice
 
 
 class WiFiScanner:
-    def __init__(self):
-        self.networks: Dict[str, WiFiNet] = {}
-        self.clients: Dict[str, List[ClientDevice]] = defaultdict(list)
-        self.scanning: bool = False
-        self.interface: str = ""
-        self.channels: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]  # Tylko 2.4GHz na początek
-        self._ch_idx: int = 0
-        self.packet_count = 0
-        self.debug = False  # Włącz debugowanie
+    def __init__(self, debug=False):
+        self.networks = {}
+        self.clients = defaultdict(list)
 
-    def log(self, message):
-        """Funkcja logowania do debugowania"""
+        self.scanning = False
+        self.deep_scanning = False
+
+        self.interface = ""
+        self.lock = threading.Lock()
+
+        self.channels_2ghz = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13]
+        self.channels_5ghz = [36, 40, 44, 48, 149, 153, 157, 161]
+        self.channels = self.channels_2ghz
+
+        self.channel_idx = 0
+        self.current_channel = 1
+        self.debug = debug
+
+        self.focus_bssid = None
+        self.processed_packets = 0
+        self.matched_packets = 0
+        self.target_bssid: Optional[str] = None
+
+
+    # ------------- LOG -------------
+
+    def log(self, msg):
         if self.debug:
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            print(f"[{timestamp}] {message}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[{ts}] {msg}", file=sys.stderr)
 
-    # ------------------ INTERFEJSY ------------------
+    # ------------- INTERFEJS / TRYBY -------------
 
-    def get_interfaces(self) -> List[str]:
-        """Zwraca listę interfejsów radiowych z `iw dev`."""
+    def get_interfaces(self):
         out = []
         try:
-            result = subprocess.run(["iw", "dev"], capture_output=True, text=True, check=True)
-            self.log(f"iw dev output: {result.stdout[:200]}...")
-            
+            result = subprocess.run(
+                ["iw", "dev"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
             for line in result.stdout.splitlines():
                 line = line.strip()
-                if line.startswith("Interface "):
-                    iface_name = line.split("Interface ", 1)[1].strip()
-                    out.append(iface_name)
-                    self.log(f"Found interface: {iface_name}")
-        except FileNotFoundError:
-            print("Error: brak 'iw' (zainstaluj wireless tools).")
-        except subprocess.CalledProcessError as e:
-            print(f"Error: 'iw dev' nie powiodło się: {e}")
+                if line.startswith("Interface"):
+                    parts = line.split()
+                    iface = parts[-1]
+                    out.append(iface)
+        except Exception as e:
+            self.log(f"get_interfaces error: {e}")
         return out
 
     def set_monitor_mode(self, iface: str) -> bool:
-        """Włącza monitor mode (ip+iw)."""
+        """
+        Przełącza wybrany interfejs w tryb monitor i odczepia go od NetworkManagera.
+        Nie dotyka innych kart (np. wlp1s0 z internetem).
+        """
         try:
-            self.log(f"Setting monitor mode for {iface}")
-            
-            # Sprawdź obecny tryb
-            result = subprocess.run(["iw", "dev", iface, "info"], capture_output=True, text=True)
-            self.log(f"Current interface info: {result.stdout}")
-            
-            # Zatrzymaj interfejs
-            subprocess.run(["ip", "link", "set", iface, "down"], check=True)
-            self.log("Interface brought down")
-            
-            # Ustaw monitor mode
-            subprocess.run(["iw", "dev", iface, "set", "type", "monitor"], check=True)
-            self.log("Monitor mode set")
-            
-            # Włącz interfejs
-            subprocess.run(["ip", "link", "set", iface, "up"], check=True)
-            self.log("Interface brought up")
-            
-            # Sprawdź nowy tryb
-            result = subprocess.run(["iw", "dev", iface, "info"], capture_output=True, text=True)
-            self.log(f"New interface info: {result.stdout}")
-            
-            print(f"[+] {iface}: monitor mode aktywny")
+            # Najpierw odpinam ten interfejs od NetworkManagera,
+            # żeby nie próbował go konfigurować jako zwykłe Wi-Fi.
+            subprocess.run(
+                ["nmcli", "dev", "disconnect", iface],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            subprocess.run(
+                ["nmcli", "dev", "set", iface, "managed", "no"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+
+            cmds = [
+                ["ip", "link", "set", iface, "down"],
+                ["iw", "dev", iface, "set", "type", "monitor"],
+                ["ip", "link", "set", iface, "up"],
+            ]
+
+            for cmd in cmds:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode != 0:
+                    self.log(
+                        f"Command failed: {' '.join(cmd)} "
+                        f"rc={result.returncode}, err={result.stderr.strip()}"
+                    )
+                    return False
+
+            time.sleep(1)
+            self.log(f"Monitor mode set on {iface}")
+            self.interface = iface
             return True
-            
-        except subprocess.CalledProcessError as e:
-            print(f"[-] Nie udało się włączyć monitor mode: {e}")
+
+        except Exception as e:
+            self.log(f"set_monitor_mode error: {e}")
             return False
 
-    def restore_managed_mode(self, iface: str) -> None:
-        """Przywraca normalny (managed) tryb Wi-Fi."""
-        try:
-            print("[*] Przywracam managed mode…")
-            subprocess.run(["ip", "link", "set", iface, "down"], check=True)
-            subprocess.run(["iw", "dev", iface, "set", "type", "managed"], check=True)
-            subprocess.run(["ip", "link", "set", iface, "up"], check=True)
-            print("[+] Managed mode przywrócony")
-        except subprocess.CalledProcessError as e:
-            print(f"[-] Błąd przywracania managed mode: {e}")
 
-    # ------------------ KANAŁY ------------------
-
-    def set_channel(self, iface: str, ch: int) -> bool:
-        """Ustawia kanał; zwraca True/False (bez wyjątku)."""
+    def restore_managed_mode(self, iface: str):
+        """
+        Przywraca interfejs do normalnego trybu Wi-Fi i oddaje go z powrotem NetworkManagerowi.
+        """
         try:
-            self.log(f"Setting channel {ch}")
+            cmds = [
+                ["ip", "link", "set", iface, "down"],
+                ["iw", "dev", iface, "set", "type", "managed"],
+                ["ip", "link", "set", iface, "up"],
+            ]
+
+            for cmd in cmds:
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+
+            # z powrotem pozwalamy NetworkManagerowi zarządzać tym interfejsem
+            subprocess.run(
+                ["nmcli", "dev", "set", iface, "managed", "yes"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+
+            self.log(f"Managed mode restored on {iface}")
+
+        except Exception as e:
+            self.log(f"restore_managed_mode error: {e}")
+
+
+    # ------------- KANAŁY -------------
+
+    def set_channel(self, iface: str, channel: int) -> bool:
+        try:
             result = subprocess.run(
-                ["iw", "dev", iface, "set", "channel", str(ch)],
-                capture_output=True, text=True
+                ["iw", "dev", iface, "set", "channel", str(channel)],
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             if result.returncode == 0:
+                self.current_channel = channel
                 return True
             else:
-                self.log(f"Channel set failed: {result.stderr}")
+                self.log(f"set_channel({channel}) failed: {result.stderr.strip()}")
                 return False
         except Exception as e:
-            self.log(f"Channel set exception: {e}")
+            self.log(f"set_channel error: {e}")
             return False
 
-    def channel_hopper(self, iface: str) -> None:
-        """Prosty hopping po kanałach."""
-        self.log("Channel hopper started")
-        while self.scanning and self.channels:
-            ch = self.channels[self._ch_idx]
-            if self.set_channel(iface, ch):
-                self.log(f"Channel set to {ch}")
-            else:
-                self.log(f"Failed to set channel {ch}")
-            
-            self._ch_idx = (self._ch_idx + 1) % len(self.channels)
-            time.sleep(1)  # 1 sekunda na kanale
+    def channel_hopper(self, iface: str):
+        """
+        Hopowanie po kanałach w fazie skanowania.
+        Robione wolniej i z limitem błędów, żeby nie zajechać sterownika.
+        """
+        self.log(f"Channel hopper started on {iface}")
+        error_streak = 0
 
-    # ------------------ PARSOWANIE PAKIETÓW ------------------
+        while self.scanning:
+            try:
+                if not self.channels:
+                    time.sleep(0.5)
+                    continue
 
-    def parse_packet(self, pkt) -> None:
-        """Główna funkcja parsująca pakiety"""
-        self.packet_count += 1
-        if self.packet_count % 50 == 0:
-            self.log(f"Processed {self.packet_count} packets, found {len(self.networks)} networks")
-        
-        # Sprawdź czy to ramka 802.11
-        if not pkt.haslayer(Dot11):
-            return
+                ch = self.channels[self.channel_idx]
+                ok = self.set_channel(iface, ch)
+                if not ok:
+                    error_streak += 1
+                    if error_streak >= 5:
+                        self.log("Too many channel set errors, stopping hopper")
+                        break
+                else:
+                    error_streak = 0
 
-        # Debug: pokaż podstawowe informacje o pakiecie
-        if self.packet_count % 20 == 0:  # Co 20 pakietów
-            self.log(f"Packet #{self.packet_count}: Type={pkt.type} Subtype={pkt.subtype}")
+                self.channel_idx = (self.channel_idx + 1) % len(self.channels)
+                time.sleep(0.7)      # było 0.15, za szybko dla sterownika
+            except Exception as e:
+                self.log(f"channel_hopper error: {e}")
+                break
 
-        # Parsuj ramki beacon/probe response (AP)
-        if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
-            self._parse_ap_packet(pkt)
-        
-        # Parsuj ramki danych i zarządzania (klienci)
-        self._detect_clients_from_packet(pkt)
+        self.log("Channel hopper stopped")
 
-    def _parse_ap_packet(self, pkt) -> None:
-        """Parsuje ramki beacon/probe response dla AP"""
+
+    # ------------- POMOCNICZE WYCIĄGANIE INFO -------------
+
+    def extract_ssid(self, pkt):
         try:
-            # Pobierz BSSID
-            if pkt.haslayer(Dot11Beacon):
-                bssid = pkt[Dot11].addr2
-            elif pkt.haslayer(Dot11ProbeResp):
-                bssid = pkt[Dot11].addr3
-            else:
-                return
+            if pkt.haslayer(Dot11Elt):
+                elt = pkt.getlayer(Dot11Elt)
+                while elt:
+                    if elt.ID == 0 and elt.info:
+                        ssid = elt.info.decode("utf-8", errors="ignore").strip()
+                        if ssid:
+                            return ssid
+                    elt = elt.payload.getlayer(Dot11Elt)
+        except Exception as e:
+            self.log(f"extract_ssid error: {e}")
+        return "<Hidden>"
 
-            if not bssid or bssid == "ff:ff:ff:ff:ff:ff":
-                return
+    def extract_channel(self, pkt):
+        try:
+            if pkt.haslayer(Dot11Elt):
+                elt = pkt.getlayer(Dot11Elt)
+                while elt:
+                    if elt.ID == 3 and elt.info:
+                        ch = elt.info[0] if isinstance(elt.info, bytes) else elt.info
+                        return int(ch)
+                    elt = elt.payload.getlayer(Dot11Elt)
+        except Exception as e:
+            self.log(f"extract_channel error: {e}")
+        return 1
 
-            self.log(f"Found AP frame from BSSID: {bssid}")
-
-            # Pobierz RSSI
-            rssi = -100
+    def extract_rssi(self, pkt):
+        try:
             if pkt.haslayer(RadioTap):
-                if hasattr(pkt[RadioTap], 'dBm_AntSignal'):
-                    rssi = pkt[RadioTap].dBm_AntSignal
-                elif hasattr(pkt[RadioTap], 'dBm_AntNoise'):
-                    rssi = pkt[RadioTap].dBm_AntNoise
+                rt = pkt[RadioTap]
+                if hasattr(rt, "dBm_AntSignal"):
+                    return int(rt.dBm_AntSignal)
+        except Exception as e:
+            self.log(f"extract_rssi error: {e}")
+        return -100
 
-            # Pobierz SSID
-            ssid = "<hidden>"
-            if pkt.haslayer(Dot11Elt):
-                elt = pkt[Dot11Elt]
-                while elt:
-                    if elt.ID == 0 and elt.info:  # SSID
-                        try:
-                            ssid_bytes = bytes(elt.info)
-                            if ssid_bytes:
-                                ssid = ssid_bytes.decode('utf-8', errors='ignore')
-                                if not ssid.strip():
-                                    ssid = "<hidden>"
-                        except Exception as e:
-                            self.log(f"SSID decode error: {e}")
-                            ssid = "<hidden>"
-                        break
-                    elt = elt.payload.getlayer(Dot11Elt)
+    # ------------- FILTR FOCUS_AP -------------
 
-            # Pobierz kanał
-            channel = 1
-            if pkt.haslayer(Dot11Elt):
-                elt = pkt[Dot11Elt]
-                while elt:
-                    if elt.ID == 3:  # DS Parameter Set (kanał)
-                        if elt.info:
-                            channel = ord(elt.info)
-                        break
-                    elt = elt.payload.getlayer(Dot11Elt)
+    def _belongs_to_focus(self, dot11):
+        if self.focus_bssid is None:
+            return True
 
-            now_iso = datetime.utcnow().isoformat() + "Z"
+        addrs = {dot11.addr1, dot11.addr2, dot11.addr3}
+        return self.focus_bssid in addrs
 
-            # Aktualizuj lub dodaj sieć
-            if bssid in self.networks:
-                network = self.networks[bssid]
-                network.signal_dbm = rssi
-                network.channel = channel
-                network.last_seen = now_iso
-                self.log(f"Updated network: {ssid} (BSSID: {bssid})")
+    # ------------- AP (BEACON / PROBE RESP) -------------
+
+    def parse_beacon(self, pkt):
+        try:
+            if not (pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)):
+                return
+
+            dot11 = pkt[Dot11]
+
+            if pkt.haslayer(Dot11ProbeResp):
+                bssid = dot11.addr3 or dot11.addr2
             else:
-                network = WiFiNet(
-                    index=len(self.networks) + 1,
-                    ssid=ssid,
-                    bssid=bssid,
-                    channel=channel,
-                    frequency_mhz=2412 + (channel - 1) * 5,  # 2.4GHz
-                    signal_dbm=rssi,
-                    beacon_interval_tu=100,
-                    akm=["Unknown"],
-                    cipher="Unknown",
-                    rsn_pmf="unknown",
-                    station_count=0,
-                    capabilities=["ESS"],
-                    first_seen=now_iso,
-                    last_seen=now_iso,
-                    vendor=self._get_vendor_from_mac(bssid)
-                )
-                self.networks[bssid] = network
-                self.log(f"NEW NETWORK: {ssid} (BSSID: {bssid}, Channel: {channel}, RSSI: {rssi})")
+                bssid = dot11.addr2
+
+            if not bssid or bssid.lower() == "ff:ff:ff:ff:ff:ff":
+                return
+
+            ssid = self.extract_ssid(pkt)
+            channel = self.extract_channel(pkt)
+            rssi = self.extract_rssi(pkt)
+
+            if 1 <= channel <= 13:
+                freq = 2412 + (channel - 1) * 5
+            elif 36 <= channel <= 177:
+                freq = 5000 + channel * 5
+            else:
+                freq = 0
+
+            now = datetime.utcnow().isoformat() + "Z"
+
+            with self.lock:
+                if bssid not in self.networks:
+                    net = WiFiNet(
+                        index=len(self.networks) + 1,
+                        ssid=ssid,
+                        bssid=bssid,
+                        channel=channel,
+                        frequency_mhz=freq,
+                        signal_dbm=rssi,
+                        beacon_interval_tu=100,
+                        akm=["Unknown"],
+                        cipher="Unknown",
+                        rsn_pmf="unknown",
+                        station_count=0,
+                        capabilities=["ESS"],
+                        first_seen=now,
+                        last_seen=now,
+                        vendor="Unknown",
+                    )
+                    self.networks[bssid] = net
+                    self.log(f"AP found: {ssid} {bssid} CH{channel} RSSI={rssi}")
+                else:
+                    net = self.networks[bssid]
+                    net.signal_dbm = rssi
+                    net.last_seen = now
 
         except Exception as e:
-            self.log(f"Error parsing AP packet: {e}")
+            self.log(f"parse_beacon error: {e}")
 
-    def _detect_clients_from_packet(self, pkt) -> None:
-        """Wykrywa klientów z różnych typów ramek"""
+    # ------------- KLIENCI Z DANYCH -------------
+
+    def parse_data_frame(self, pkt):
         try:
             if not pkt.haslayer(Dot11):
                 return
 
-            now_iso = datetime.utcnow().isoformat() + "Z"
-            rssi = -100
-            if pkt.haslayer(RadioTap):
-                if hasattr(pkt[RadioTap], 'dBm_AntSignal'):
-                    rssi = pkt[RadioTap].dBm_AntSignal
+            dot11 = pkt[Dot11]
 
-            # Ramki danych
-            if pkt.haslayer(Dot11) and pkt.type == 2:  # Data frames
-                addr1 = pkt.addr1  # Receiver
-                addr2 = pkt.addr2  # Transmitter
-                addr3 = pkt.addr3  # BSSID
+            if not self._belongs_to_focus(dot11):
+                return
 
-                # Sprawdź różne kombinacje
-                if (addr2 and addr2 not in self.networks and 
-                    addr1 and addr1 in self.networks):
-                    # Client -> AP
-                    self._add_or_update_client(addr2, addr1, rssi, now_iso)
-                
-                elif (addr1 and addr1 not in self.networks and 
-                      addr2 and addr2 in self.networks):
-                    # AP -> Client
-                    self._add_or_update_client(addr1, addr2, rssi, now_iso)
+            if dot11.type != 2:
+                return
 
-            # Ramki zarządzania
-            elif pkt.haslayer(Dot11) and pkt.type == 0:  # Management frames
-                if pkt.subtype in [11, 0]:  # Authentication, Association Request
-                    # Client -> AP
-                    client_mac = pkt.addr2
-                    ap_mac = pkt.addr1
-                    if (client_mac and ap_mac and ap_mac in self.networks and
-                        client_mac not in self.networks):
-                        self._add_or_update_client(client_mac, ap_mac, rssi, now_iso)
+            fc = dot11.FCfield
+            to_ds = bool(fc & 0x01)
+            from_ds = bool(fc & 0x02)
+
+            addr1 = dot11.addr1
+            addr2 = dot11.addr2
+
+            rssi = self.extract_rssi(pkt)
+            now = datetime.utcnow().isoformat() + "Z"
+
+            # client -> AP
+            if to_ds and not from_ds:
+                ap = addr1
+                client = addr2
+                if ap in self.networks and client and client != "ff:ff:ff:ff:ff:ff":
+                    self._add_client(client, ap, rssi, now)
+                    self.matched_packets += 1
+
+            # AP -> client
+            elif not to_ds and from_ds:
+                ap = addr2
+                client = addr1
+                if ap in self.networks and client and client != "ff:ff:ff:ff:ff:ff":
+                    self._add_client(client, ap, rssi, now)
+                    self.matched_packets += 1
 
         except Exception as e:
-            self.log(f"Error detecting clients: {e}")
+            self.log(f"parse_data_frame error: {e}")
 
-    def _add_or_update_client(self, client_mac: str, ap_bssid: str, rssi: int, timestamp: str):
-        """Dodaje lub aktualizuje klienta"""
+    # ------------- KLIENCI Z MGMT -------------
+
+    def parse_mgmt_frame(self, pkt):
         try:
-            # Sprawdź czy klient już istnieje
-            existing_client = None
-            for client in self.clients[ap_bssid]:
-                if client.mac == client_mac:
-                    existing_client = client
-                    break
-            
-            if existing_client:
-                existing_client.signal_dbm = rssi
-                existing_client.last_seen = timestamp
-            else:
-                client = ClientDevice(
+            if not pkt.haslayer(Dot11):
+                return
+
+            dot11 = pkt[Dot11]
+
+            if not self._belongs_to_focus(dot11):
+                return
+
+            if dot11.type != 0:
+                return
+
+            if dot11.subtype in [0, 2, 11]:
+                client = dot11.addr2
+                ap = dot11.addr1
+                rssi = self.extract_rssi(pkt)
+                now = datetime.utcnow().isoformat() + "Z"
+
+                if ap in self.networks and client and client != "ff:ff:ff:ff:ff:ff":
+                    self._add_client(client, ap, rssi, now)
+                    self.matched_packets += 1
+
+        except Exception as e:
+            self.log(f"parse_mgmt_frame error: {e}")
+
+    # ------------- DODAWANIE KLIENTA -------------
+
+    def _add_client(self, client_mac, ap_bssid, rssi, timestamp):
+        try:
+            with self.lock:
+                for client in self.clients[ap_bssid]:
+                    if client.mac == client_mac:
+                        client.signal_dbm = rssi
+                        client.last_seen = timestamp
+                        return
+
+                new_client = ClientDevice(
                     mac=client_mac,
                     ap_bssid=ap_bssid,
                     signal_dbm=rssi,
                     last_seen=timestamp,
-                    vendor=self._get_vendor_from_mac(client_mac)
+                    vendor="Unknown",
                 )
-                self.clients[ap_bssid].append(client)
-                self.log(f"NEW CLIENT: {client_mac} -> AP: {ap_bssid} (RSSI: {rssi})")
-                
+                self.clients[ap_bssid].append(new_client)
+
+                if ap_bssid in self.networks:
+                    self.networks[ap_bssid].station_count = len(
+                        self.clients[ap_bssid]
+                    )
+
+                self.log(f"Client found: {client_mac} -> {ap_bssid}")
         except Exception as e:
-            self.log(f"Error adding client: {e}")
+            self.log(f"_add_client error: {e}")
 
-    def _get_vendor_from_mac(self, mac: str) -> str:
-        """Proste mapowanie OUI MAC na producenta"""
-        if not mac or len(mac) < 8:
-            return "Unknown"
-        
-        oui = mac.lower()[:8]
-        vendors = {
-            "00:50:f2": "Microsoft", "00:1b:63": "Apple", "00:1d:4f": "Apple",
-            "00:23:12": "Apple", "00:25:00": "Apple", "00:26:08": "Apple",
-            "00:26:4a": "Apple", "00:26:b0": "Apple", "00:30:65": "Apple",
-            "00:56:cd": "Apple", "00:a0:40": "Apple", "00:0c:29": "VMware",
-            "00:1a:11": "Google", "00:1e:65": "Google", "00:26:01": "Samsung",
-            "08:00:27": "VirtualBox", "08:ee:8b": "Samsung", "10:30:47": "Samsung",
-            "14:10:9f": "Apple", "18:af:61": "Apple", "1c:ab:a7": "Samsung",
-            "20:aa:4b": "Apple", "24:a2:e1": "Apple", "28:37:37": "Apple",
-            "28:cf:da": "Apple", "28:cf:e9": "Apple", "2c:33:61": "Apple",
-            "2c:be:08": "Apple", "30:f7:0d": "Apple", "34:12:98": "Apple",
-            "34:36:3b": "Apple", "38:48:4c": "Apple", "3c:07:54": "Apple",
-            "3c:15:c2": "Apple", "3c:a0:67": "Raspberry Pi", "40:30:04": "Apple",
-            "44:00:10": "Apple", "48:60:bc": "Apple", "4c:32:75": "Apple",
-            "50:1a:c5": "Microsoft", "54:26:96": "Apple", "54:72:4f": "Apple",
-            "54:e4:3a": "Apple", "5c:96:9d": "Apple", "60:33:4b": "Apple",
-            "64:a3:cb": "Apple", "68:09:27": "Apple", "68:5b:35": "Apple",
-            "68:96:7b": "Apple", "6c:70:9f": "Apple", "6c:94:f8": "Apple",
-            "70:56:81": "Apple", "78:31:c1": "Apple", "78:7b:8a": "Apple",
-            "78:ca:39": "Apple", "7c:6d:62": "Apple", "7c:c3:a1": "Apple",
-            "80:00:6e": "Apple", "84:29:99": "Apple", "84:38:35": "Apple",
-            "84:85:06": "Apple", "84:8e:0c": "Apple", "84:b1:53": "Apple",
-            "88:53:95": "Apple", "8c:2d:aa": "Apple", "8c:7b:9d": "Apple",
-            "90:60:f1": "Apple", "90:72:40": "Apple", "94:94:26": "Apple",
-            "98:01:a7": "Apple", "98:b8:e3": "Apple", "98:d6:bb": "Apple",
-            "98:fe:94": "Apple", "9c:04:eb": "Apple", "9c:20:7b": "Apple",
-            "9c:35:eb": "Apple", "a0:99:9b": "Apple", "a4:31:35": "Apple",
-            "a4:b1:97": "Apple", "a4:c3:61": "Apple", "a8:20:66": "Apple",
-            "a8:86:dd": "Apple", "a8:88:08": "Apple", "a8:96:8a": "Apple",
-            "ac:29:3a": "Raspberry Pi", "ac:3a:7a": "Raspberry Pi",
-            "ac:bc:32": "Apple", "b0:34:95": "Apple", "b0:65:bd": "Apple",
-            "b0:9f:ba": "Apple", "b4:18:d1": "Apple", "b4:f0:ab": "Apple",
-            "b8:09:8a": "Apple", "b8:8d:12": "Apple", "b8:e8:56": "Apple",
-            "b8:f6:b1": "Apple", "bc:3b:af": "Raspberry Pi", "bc:52:b7": "Samsung",
-            "bc:67:78": "Apple", "bc:92:6b": "Apple", "c0:63:94": "Apple",
-            "c0:84:7a": "Apple", "c0:ce:cd": "Apple", "c4:2c:03": "Apple",
-            "c8:2a:14": "Apple", "c8:69:cd": "Apple", "c8:85:50": "Apple",
-            "c8:b5:b7": "Apple", "cc:08:e0": "Apple", "cc:20:e8": "Apple",
-            "cc:29:f5": "Apple", "d0:23:db": "Apple", "d0:81:7a": "Apple",
-            "d8:30:62": "Apple", "d8:96:95": "Apple", "dc:2b:2a": "Apple",
-            "dc:37:14": "Lenovo", "dc:41:5f": "Raspberry Pi", "dc:86:d8": "Apple",
-            "e0:66:78": "TP-Link", "e0:ac:cb": "Apple", "e0:b9:ba": "Apple",
-            "e0:c7:67": "Raspberry Pi", "e4:25:e7": "TP-Link", "e8:04:0b": "Apple",
-            "e8:06:88": "Apple", "ec:35:86": "Raspberry Pi", "f0:18:98": "Apple",
-            "f0:24:75": "Apple", "f0:99:bf": "Raspberry Pi", "f0:cb:a1": "Raspberry Pi",
-            "f4:37:b7": "Apple", "f8:1e:df": "Intel",
-        }
-        return vendors.get(oui, "Unknown")
+    # ------------- HANDLERY DO SNIFFA -------------
 
-    # ------------------ START/STOP SNIFFA ------------------
+    def packet_handler_ap_discovery(self, pkt):
+        try:
+            if not pkt.haslayer(Dot11):
+                return
+            self.parse_beacon(pkt)
+        except Exception as e:
+            self.log(f"packet_handler_ap_discovery error: {e}")
 
-    def start_scan(self, iface: str) -> None:
-        """Uruchamia hoppera i sniffer."""
+    def packet_handler_deep_scan(self, pkt):
+        try:
+            if not pkt.haslayer(Dot11):
+                return
+
+            self.processed_packets += 1
+
+            self.parse_beacon(pkt)
+            self.parse_data_frame(pkt)
+            self.parse_mgmt_frame(pkt)
+
+            if self.debug and self.processed_packets % 200 == 0:
+                self.log(
+                    f"[DEEP] processed={self.processed_packets}, "
+                    f"matched={self.matched_packets}, "
+                    f"focus_bssid={self.focus_bssid}"
+                )
+
+        except Exception as e:
+            self.log(f"packet_handler_deep_scan error: {e}")
+
+    # ------------- START / STOP -------------
+
+    def start_ap_discovery(self, iface: str):
+        """
+        Faza 1: skanowanie AP po wszystkich kanałach.
+        Najpierw próbujemy ustawić pierwszy kanał.
+        Jeśli to się nie uda, nie odpalamy hoppera ani sniffera.
+        """
         self.interface = iface
         self.scanning = True
+        self.deep_scanning = False
+        self.focus_bssid = None
+        self.target_bssid = None
 
-        # Uruchom channel hopper
-        hopper_thread = threading.Thread(target=self.channel_hopper, args=(iface,), daemon=True)
-        hopper_thread.start()
-        self.log("Channel hopper thread started")
+        # szybki test: spróbuj ustawić pierwszy kanał z listy
+        if self.channels:
+            first_ch = self.channels[0]
+            if not self.set_channel(iface, first_ch):
+                self.log(f"Cannot set initial channel {first_ch} on {iface}, aborting AP discovery")
+                self.scanning = False
+                return
 
-        print(f"[*] Start pasywnego skanu na {iface} (Ctrl+C aby przerwać)…")
-        
+        hopper = threading.Thread(
+            target=self.channel_hopper,
+            args=(iface,),
+            daemon=True,
+        )
+        hopper.start()
+        self.log(f"AP Discovery started on {iface}")
+
         try:
-            # Sniff z timeout i filtrem
             sniff(
                 iface=iface,
-                prn=self.parse_packet,
-                store=0,
+                prn=self.packet_handler_ap_discovery,
+                store=False,
                 stop_filter=lambda x: not self.scanning,
-                timeout=300  # 5 minut timeout
             )
         except Exception as e:
-            print(f"[-] Błąd sniffera: {e}")
-            self.log(f"Sniffer error details: {e}")
+            self.log(f"AP Discovery error: {e}")
+        finally:
+            self.log("AP Discovery sniff stopped")
 
-    def stop_scan(self) -> None:
+
+    def lock_on_ap(self, iface, bssid, channel):
+        self.interface = iface
         self.scanning = False
+        self.deep_scanning = True
+        self.focus_bssid = bssid
+
+        self.processed_packets = 0
+        self.matched_packets = 0
+
+        self.set_channel(iface, channel)
+        self.log(f"Deep scan locked on {bssid} CH{channel}")
+
+        try:
+            sniff(
+                iface=iface,
+                prn=self.packet_handler_deep_scan,
+                store=False,
+                stop_filter=lambda x: not self.deep_scanning,
+            )
+        except Exception as e:
+            self.log(f"Deep scan error: {e}")
+        finally:
+            self.focus_bssid = None
+            self.log("Deep scan finished")
+
+    def stop_scan(self):
+        self.scanning = False
+        self.deep_scanning = False
+        self.focus_bssid = None
         self.log("Scanning stopped")
 
-    # ------------------ DOSTĘP / WYŚWIETLANIE ------------------
+    # ------------- DOSTĘP DO DANYCH -------------
 
-    def get_network_list(self) -> List[WiFiNet]:
-        """Zwraca listę sieci posortowaną po sile sygnału (malejąco)."""
-        return sorted(self.networks.values(), key=lambda n: n.signal_dbm, reverse=True)
+    def get_network_list(self):
+        with self.lock:
+            return sorted(
+                self.networks.values(),
+                key=lambda n: n.signal_dbm,
+                reverse=True,
+            )
 
-    def get_clients_for_ap(self, ap_bssid: str) -> List[ClientDevice]:
-        """Zwraca listę klientów dla danego AP."""
-        return self.clients.get(ap_bssid, [])
+    def get_clients_for_ap(self, ap_bssid):
+        with self.lock:
+            return self.clients.get(ap_bssid, [])
 
-    def display_network_details(self, net: WiFiNet) -> None:
-        """Czytelny podgląd jednej sieci z klientami."""
-        print("\n" + "=" * 60)
-        print(f"DETAILS FOR: {net.ssid}")
-        print("=" * 60)
-        print(f"SSID:        {net.ssid}")
-        print(f"BSSID:       {net.bssid}")
-        print(f"Channel:     {net.channel}")
-        print(f"Frequency:   {net.frequency_mhz} MHz")
-        print(f"Signal:      {net.signal_dbm} dBm")
-        print(f"Vendor:      {net.vendor}")
-        print(f"First seen:  {net.first_seen}")
-        print(f"Last seen:   {net.last_seen}")
-        
-        # Wyświetl klientów
-        clients = self.get_clients_for_ap(net.bssid)
-        print(f"\nConnected Clients: {len(clients)}")
-        print("-" * 60)
-        
-        if clients:
-            print(f"{'#':<2} {'MAC Address':<18} {'Signal':<8} {'Vendor':<15} {'Last Seen'}")
-            print("-" * 60)
-            for i, client in enumerate(clients, 1):
-                time_str = client.last_seen[11:19] if len(client.last_seen) > 19 else client.last_seen
-                print(f"{i:<2} {client.mac:<18} {client.signal_dbm:<8} {client.vendor:<15} {time_str}")
-        else:
-            print("No clients detected yet...")
-            print("Keep scanning to discover connected devices")
-        
-        print("=" * 60)
+    # ------------- EXPORT -------------
 
-    def display_attack_candidates(self, net: WiFiNet) -> None:
-        """Pokazuje szczegółową ocenę podatności."""
-        print("\n" + "=" * 60)
-        print(f"SECURITY ASSESSMENT FOR: {net.ssid}")
-        print("=" * 60)
-        
-        clients = self.get_clients_for_ap(net.bssid)
-        
-        print(f"Network: {net.ssid}")
-        print(f"BSSID: {net.bssid}")
-        print(f"Channel: {net.channel}")
-        print(f"Signal: {net.signal_dbm} dBm")
-        print(f"Vendor: {net.vendor}")
-        
-        print(f"\nConnected Clients: {len(clients)}")
-        if clients:
-            print("Available for testing:")
-            for i, client in enumerate(clients, 1):
-                print(f"  {i}. {client.mac} ({client.vendor}) - Signal: {client.signal_dbm} dBm")
-        else:
-            print("No clients detected - keep scanning")
-        
-        print("=" * 60)
-
-    def export_results(self, filename: str = None) -> str:
-        """Eksportuje wyniki do JSON."""
+    def export_results(self, filename=None):
         if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"wifi_scan_results_{timestamp}.json"
-        
-        from dataclasses import asdict
-        data = {
-            "networks": [asdict(n) for n in self.get_network_list()],
-            "clients": {
-                ap_bssid: [asdict(c) for c in clients] 
-                for ap_bssid, clients in self.clients.items()
-            },
-            "scan_info": {
-                "timestamp": datetime.now().isoformat(),
-                "interface": self.interface,
-                "total_networks": len(self.networks),
-                "total_clients": sum(len(clients) for clients in self.clients.values()),
-                "total_packets": self.packet_count
-            }
-        }
-        
-        with open(filename, "w") as f:
-            json.dump(data, f, indent=2)
-        
-        return filename
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"wifi_scan_{ts}.json"
+
+        try:
+            import json
+            from dataclasses import asdict
+
+            with self.lock:
+                data = {
+                    "networks": [asdict(n) for n in self.get_network_list()],
+                    "clients": {
+                        ap: [asdict(c) for c in cls]
+                        for ap, cls in self.clients.items()
+                    },
+                    "summary": {
+                        "timestamp": datetime.now().isoformat(),
+                        "interface": self.interface,
+                        "total_networks": len(self.networks),
+                        "total_clients": sum(
+                            len(cls) for cls in self.clients.values()
+                        ),
+                    },
+                }
+
+            with open(filename, "w") as f:
+                json.dump(data, f, indent=2)
+
+            return filename
+        except Exception as e:
+            self.log(f"export_results error: {e}")
+            return None
+
