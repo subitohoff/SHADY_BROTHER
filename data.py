@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 
@@ -13,17 +13,17 @@ class WiFiNet:
     frequency_mhz: int
     signal_dbm: int
     beacon_interval_tu: int
-    akm: List[str]
-    cipher: str
-    rsn_pmf: str
     station_count: int
-    capabilities: List[str]
     first_seen: str
     last_seen: str
     vendor: str
+    akm: List[str] = field(default_factory=lambda: ["Unknown"])
+    cipher: str = "Unknown"
+    rsn_pmf: str = "unknown"
+    capabilities: List[str] = field(default_factory=lambda: ["ESS"])
     country: str = ""
     wps: bool = False
-
+    
 
 @dataclass
 class ClientDevice:
@@ -34,4 +34,3 @@ class ClientDevice:
     ip_address: str = ""
     vendor: str = ""
     connected: bool = True
-
